@@ -1,0 +1,247 @@
+#!/bin/bash
+# heidi — hide the names of folders and files on your macOS Desktop.
+# Copyright 2026 codepurr. Licensed under the Apache License, Version 2.0.
+#
+#   heidi hide all      hide folders and files
+#   heidi hide img      hide images
+#   heidi hide folders  hide folders
+#   heidi hide files    hide files
+#   heidi show          restore all names
+#   heidi status        show what is currently hidden
+#   heidi reveal        recover blank items that lost their restore key
+#
+# Override the target directory with HEIDI_DIR (handy for tests).
+
+set -u
+
+VERSION="1.0.0"
+XATTR_KEY="com.heidi.original"               # original name of the item
+XATTR_EXT="com.heidi.exthidden"              # original "hide extension" state (true/false)
+TARGET="${HEIDI_DIR:-$HOME/Desktop}"
+
+# Invisible characters (UTF-8):
+#   U+2800 BRAILLE PATTERN BLANK — an empty cell: Finder draws a label with no text
+#   U+200B ZERO WIDTH SPACE      — zero width, used only to keep blank names unique
+BLANK=$'\xe2\xa0\x80'
+ZWSP=$'\xe2\x80\x8b'
+
+# The "hide extension" flag lives in com.apple.FinderInfo: bit 0x0010 in the byte at offset 9.
+# We set it directly via xattr — no Finder/Automation, works on any name (including invisible ones).
+FINFO_ZERO="0000000000000000000000000000000000000000000000000000000000000000"
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+  heidi hide all      hide folders and files
+  heidi hide img      hide images
+  heidi hide folders  hide folders
+  heidi hide files    hide files
+  heidi show          restore everything
+  heidi status        show what is hidden
+  heidi reveal        recover blank items that lost their key
+  heidi -h            help
+
+override the target directory with HEIDI_DIR.
+EOF
+}
+
+# Bundles are technically folders but are "apps": leave them (nocasematch also matches .APP etc.).
+is_bundle() {
+  case "$1" in
+    *.app|*.bundle|*.framework|*.plugin|*.kext|*.photoslibrary|*.aplibrary|\
+    *.imovielibrary|*.tvlibrary|*.rtfd|*.download|*.localized) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Exact match for our naming scheme: U+2800, then any number of U+200B, then optional ".ext".
+is_our_blank() {
+  local rest="$1"
+  case "$rest" in "$BLANK"*) rest="${rest#"$BLANK"}" ;; *) return 1 ;; esac
+  while case "$rest" in "$ZWSP"*) true ;; *) false ;; esac; do rest="${rest#"$ZWSP"}"; done
+  case "$rest" in ""|.*) return 0 ;; *) return 1 ;; esac
+}
+
+# 64 hex chars (lowercase) of the current FinderInfo, or all zeros.
+finfo_hex() {
+  local h
+  h=$(xattr -px com.apple.FinderInfo "$1" 2>/dev/null | tr -d ' \n\r' | tr 'A-F' 'a-f')
+  [ "${#h}" -eq 64 ] && printf '%s' "$h" || printf '%s' "$FINFO_ZERO"
+}
+
+# Read the "hide extension" flag: prints true/false.
+ext_get_hidden() {
+  local h; h=$(finfo_hex "$1")
+  [ $(( 16#${h:18:2} & 16#10 )) -ne 0 ] && printf 'true' || printf 'false'
+}
+
+# Set (true) / clear (false) the flag, preserving the other FinderInfo bytes.
+ext_set_hidden() {
+  local h b9 nb newh
+  h=$(finfo_hex "$1"); b9=$(( 16#${h:18:2} ))
+  if [ "$2" = true ]; then nb=$(( b9 | 16#10 )); else nb=$(( b9 & ~16#10 & 16#ff )); fi
+  newh="${h:0:18}$(printf '%02x' "$nb")${h:20}"
+  if [ "$newh" = "$FINFO_ZERO" ]; then
+    xattr -d com.apple.FinderInfo "$1" 2>/dev/null     # do not leave an empty FinderInfo
+  else
+    xattr -wx com.apple.FinderInfo "$newh" "$1" 2>/dev/null
+  fi
+}
+
+# Unique "blank" name inside $TARGET; arg is the extension ("" for folders and files without one).
+unique_blank_name() {
+  local ext="${1:-}" k=0 name i
+  while :; do
+    name="$BLANK"; i=0
+    while [ "$i" -lt "$k" ]; do name="$name$ZWSP"; i=$((i + 1)); done
+    [ -n "$ext" ] && name="$name.$ext"
+    [ -e "$TARGET/$name" ] || break
+    k=$((k + 1))
+  done
+  printf '%s' "$name"
+}
+
+cmd_hide() {
+  local scope="${1:-all}"
+  local inc_folders file_filter                        # inc_folders: 0/1 ; file_filter: none|images|all
+  case "$scope" in
+    all)              inc_folders=1; file_filter=all ;;
+    img|image|images) inc_folders=0; file_filter=images ;;
+    folders|folder)   inc_folders=1; file_filter=none ;;
+    files|file)       inc_folders=0; file_filter=all ;;
+    *) die "unknown mode: $scope (all|img|folders|files)" ;;
+  esac
+  [ -d "$TARGET" ] || die "Folder not found: $TARGET"
+
+  local count=0 f name ext newpath eh
+  shopt -s nocasematch
+  for f in "$TARGET"/*; do
+    [ -e "$f" ] || continue
+    [ -L "$f" ] && continue                            # leave symlinks alone
+    name="${f##*/}"
+    is_our_blank "$name" && continue                   # already hidden by us
+    xattr -p "$XATTR_KEY" "$f" >/dev/null 2>&1 && continue
+
+    ext=""
+    if [ -d "$f" ]; then
+      [ "$inc_folders" -eq 1 ] || continue
+      is_bundle "$name" && continue
+    elif [ -f "$f" ]; then
+      [ "$file_filter" = none ] && continue
+      ext="${name##*.}"; [ "$ext" = "$name" ] && ext=""
+      [ "$file_filter" = images ] && case "$ext" in
+        jpg|jpeg|png|gif|heic|heif|webp|tiff|tif|bmp|svg) ;; *) continue ;;
+      esac
+    else
+      continue
+    fi
+
+    newpath="$TARGET/$(unique_blank_name "$ext")"
+    if mv "$f" "$newpath" 2>/dev/null; then
+      if xattr -w "$XATTR_KEY" "$name" "$newpath" 2>/dev/null; then
+        if [ -n "$ext" ]; then                         # file with an extension: save and hide it
+          eh=$(ext_get_hidden "$newpath")
+          xattr -w "$XATTR_EXT" "$eh" "$newpath" 2>/dev/null
+          ext_set_hidden "$newpath" true
+        fi
+        count=$((count + 1))
+      else
+        mv "$newpath" "$f" 2>/dev/null                 # roll back: a name must never vanish without its key
+        printf '%s\n' "Skipped (could not save restore key): $name" >&2
+      fi
+    else
+      printf '%s\n' "Could not hide: $name" >&2
+    fi
+  done
+  shopt -u nocasematch
+  printf '%s\n' "Hidden: $count"
+}
+
+cmd_show() {
+  [ -d "$TARGET" ] || die "Folder not found: $TARGET"
+  local count=0 f orig dest i stem ex eh
+  for f in "$TARGET"/*; do
+    [ -e "$f" ] || continue
+    orig=$(xattr -p "$XATTR_KEY" "$f" 2>/dev/null) || continue
+    [ -n "$orig" ] || continue
+    dest="$TARGET/$orig"
+    if [ -e "$dest" ]; then                             # name taken — add a suffix (for files, before the extension)
+      if [ -f "$f" ] && [ "${orig##*.}" != "$orig" ]; then
+        stem="${orig%.*}"; ex="${orig##*.}"; i=2
+        dest="$TARGET/$stem $i.$ex"
+        while [ -e "$dest" ]; do i=$((i + 1)); dest="$TARGET/$stem $i.$ex"; done
+      else
+        i=2; dest="$TARGET/$orig $i"
+        while [ -e "$dest" ]; do i=$((i + 1)); dest="$TARGET/$orig $i"; done
+      fi
+      printf '%s\n' "Name \"$orig\" is taken — restored as \"${dest##*/}\"" >&2
+    fi
+    if mv "$f" "$dest" 2>/dev/null; then
+      if [ -f "$dest" ] && eh=$(xattr -p "$XATTR_EXT" "$dest" 2>/dev/null); then
+        ext_set_hidden "$dest" "$eh"                    # restore the original extension state
+        xattr -d "$XATTR_EXT" "$dest" 2>/dev/null
+      fi
+      xattr -d "$XATTR_KEY" "$dest" 2>/dev/null || printf '%s\n' "Warning: restore key left on \"${dest##*/}\"" >&2
+      count=$((count + 1))
+    else
+      printf '%s\n' "Could not restore: $orig" >&2
+    fi
+  done
+  printf '%s\n' "Restored: $count"
+}
+
+cmd_status() {
+  [ -d "$TARGET" ] || die "Folder not found: $TARGET"
+  local f orig n=0 orphans=0 name kind
+  for f in "$TARGET"/*; do
+    [ -e "$f" ] || continue
+    name="${f##*/}"
+    if orig=$(xattr -p "$XATTR_KEY" "$f" 2>/dev/null); then
+      [ -n "$orig" ] || continue
+      [ -d "$f" ] && kind="folder" || kind="file"
+      n=$((n + 1))
+      printf '%s\n' "  • hidden ($kind): $orig"
+    elif is_our_blank "$name"; then
+      orphans=$((orphans + 1))
+    fi
+  done
+  [ "$n" -eq 0 ] && printf '%s\n' "Nothing hidden: $TARGET" || printf '%s\n' "Hidden total: $n  (in: $TARGET)"
+  [ "$orphans" -gt 0 ] && printf '%s\n' "Orphans without restore key: $orphans — recover with: heidi reveal" >&2
+  return 0
+}
+
+cmd_reveal() {
+  [ -d "$TARGET" ] || die "Folder not found: $TARGET"
+  local count=0 f name ext dest n=1
+  for f in "$TARGET"/*; do
+    [ -e "$f" ] || continue
+    name="${f##*/}"
+    is_our_blank "$name" || continue
+    xattr -p "$XATTR_KEY" "$f" >/dev/null 2>&1 && continue   # has a key → that is show's job
+    ext="${name##*.}"; [ "$ext" = "$name" ] && ext=""
+    [ -n "$ext" ] && dest="$TARGET/recovered-$n.$ext" || dest="$TARGET/recovered-$n"
+    while [ -e "$dest" ]; do
+      n=$((n + 1))
+      [ -n "$ext" ] && dest="$TARGET/recovered-$n.$ext" || dest="$TARGET/recovered-$n"
+    done
+    if mv "$f" "$dest" 2>/dev/null; then
+      [ -f "$dest" ] && ext_set_hidden "$dest" false   # show the extension on the recovered file
+      count=$((count + 1)); n=$((n + 1))
+      printf '%s\n' "Recovered: ${dest##*/}"
+    else
+      printf '%s\n' "Could not recover blank item" >&2
+    fi
+  done
+  printf '%s\n' "Recovered: $count"
+}
+
+case "${1:-}" in
+  hide)         cmd_hide "${2:-all}" ;;
+  show)         cmd_show ;;
+  status)       cmd_status ;;
+  reveal)       cmd_reveal ;;
+  -h|--help)    usage ;;
+  -v|--version) printf 'heidi %s\n' "$VERSION" ;;
+  *)            usage >&2; exit 1 ;;
+esac
